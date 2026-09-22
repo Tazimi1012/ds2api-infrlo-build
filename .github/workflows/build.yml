@@ -17,7 +17,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Download the reviewed source commit
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: Tazimi1012/ds2api
           ref: 8316cf8a0352e900e03ce600b792083f590d80e2
@@ -62,8 +62,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and publish the runtime image
-        id: publish
+      - name: Build and publish (attempt 1 of 3)
+        id: build1
+        continue-on-error: true
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -78,6 +79,83 @@ jobs:
             org.opencontainers.image.version=4.6.1-infrlo
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Wait before build attempt 2
+        if: ${{ steps.build1.outcome == 'failure' }}
+        shell: bash
+        run: sleep 20
+
+      - name: Build and publish (attempt 2 of 3)
+        id: build2
+        if: ${{ steps.build1.outcome == 'failure' }}
+        continue-on-error: true
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          target: runtime-from-source
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=8316cf8a0352e900e03ce600b792083f590d80e2
+            org.opencontainers.image.version=4.6.1-infrlo
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Wait before build attempt 3
+        if: ${{ steps.build2.outcome == 'failure' }}
+        shell: bash
+        run: sleep 40
+
+      - name: Build and publish (attempt 3 of 3)
+        id: build3
+        if: ${{ steps.build2.outcome == 'failure' }}
+        continue-on-error: true
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          target: runtime-from-source
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=8316cf8a0352e900e03ce600b792083f590d80e2
+            org.opencontainers.image.version=4.6.1-infrlo
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Require a successful build and select its digest
+        id: publish
+        shell: bash
+        env:
+          RESULT1: ${{ steps.build1.outcome }}
+          RESULT2: ${{ steps.build2.outcome }}
+          RESULT3: ${{ steps.build3.outcome }}
+          DIGEST1: ${{ steps.build1.outputs.digest }}
+          DIGEST2: ${{ steps.build2.outputs.digest }}
+          DIGEST3: ${{ steps.build3.outputs.digest }}
+        run: |
+          set -euo pipefail
+          digest=''
+          if [ "$RESULT1" = success ]; then
+            digest="$DIGEST1"
+          elif [ "$RESULT2" = success ]; then
+            digest="$DIGEST2"
+          elif [ "$RESULT3" = success ]; then
+            digest="$DIGEST3"
+          else
+            echo '::error::All build attempts failed. Inspect the first relevant error in the build logs; no deployment file will be generated.'
+            exit 1
+          fi
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo '::error::The successful build did not return a valid image digest.'
+            exit 1
+          fi
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
 
       - name: Smoke test without a DeepSeek account
         shell: bash
@@ -142,7 +220,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload deployment files
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: infrlo-deploy-files
           path: infrlo-deploy-files/
