@@ -1,0 +1,160 @@
+name: Export DS2API runtime for Infrlo commands
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_ref:
+        description: 'Reviewed image reference; keep the complete sha256 digest'
+        required: true
+        default: 'ghcr.io/tazimi1012/ds2api-infrlo@sha256:46a055ce8fd6752eee8cc7dd5066db4f52c5ec7ab7f149e71311a0d5c91d3ae3'
+        type: string
+
+permissions:
+  contents: write
+  packages: read
+
+concurrency:
+  group: ds2api-runtime-export
+  cancel-in-progress: false
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Obtain the matching source license
+        uses: actions/checkout@v5
+        with:
+          repository: Tazimi1012/ds2api
+          ref: 8316cf8a0352e900e03ce600b792083f590d80e2
+          persist-credentials: false
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract existing binaries and static files without running containers
+        shell: bash
+        env:
+          IMAGE_REF: ${{ inputs.image_ref }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$IMAGE_REF" =~ ^ghcr\.io/tazimi1012/ds2api-infrlo@sha256:[0-9a-f]{64}$ ]]; then
+            echo '::error::Unexpected image reference. Use the approved GHCR repository and an immutable digest.'
+            exit 1
+          fi
+          mkdir -p runtime-assets export-stage
+          cleanup() { docker rm -f ds2api-export-amd64 ds2api-export-arm64 >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          for arch in amd64 arm64; do
+            docker pull --platform "linux/$arch" "$IMAGE_REF"
+            cid="$(docker create --platform "linux/$arch" --name "ds2api-export-$arch" "$IMAGE_REF")"
+            dest="export-stage/$arch"
+            mkdir -p "$dest/static/admin"
+            docker cp "$cid:/usr/local/bin/ds2api" "$dest/ds2api"
+            docker cp "$cid:/app/static/admin/." "$dest/static/admin/"
+            docker cp "$cid:/etc/ssl/certs/ca-certificates.crt" "$dest/ca-certificates.crt"
+            cp LICENSE "$dest/LICENSE"
+            printf '%s\n' \
+              'Source: https://github.com/Tazimi1012/ds2api/tree/8316cf8a0352e900e03ce600b792083f590d80e2' \
+              "Image: $IMAGE_REF" \
+              'Application code is unchanged. This archive exports the runtime files from the image.' \
+              > "$dest/SOURCE.txt"
+            test -s "$dest/ds2api"
+            test -s "$dest/static/admin/index.html"
+            test -s "$dest/ca-certificates.crt"
+            chmod 0755 "$dest/ds2api"
+            tar -czf "runtime-assets/ds2api-linux-$arch.tar.gz" -C "$dest" .
+            docker rm "$cid" >/dev/null
+          done
+
+      - name: Generate a version-pinned download manifest
+        id: manifest
+        shell: bash
+        env:
+          IMAGE_REF: ${{ inputs.image_ref }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          tag = 'runtime-' + os.environ['GITHUB_RUN_ID'] + '-' + os.environ['GITHUB_RUN_ATTEMPT']
+          repo = os.environ['GITHUB_REPOSITORY']
+          manifest = {
+              'schema_version': 1,
+              'release_repository': repo,
+              'release_tag': tag,
+              'source_commit': '8316cf8a0352e900e03ce600b792083f590d80e2',
+              'source_image': os.environ['IMAGE_REF'],
+              'platforms': {},
+          }
+          checksums = []
+          def digest(p):
+              h = hashlib.sha256()
+              with p.open('rb') as f:
+                  for b in iter(lambda: f.read(1024*1024), b''):
+                      h.update(b)
+              return h.hexdigest()
+          for arch in ['amd64', 'arm64']:
+              archive = Path('runtime-assets') / ('ds2api-linux-' + arch + '.tar.gz')
+              stage = Path('export-stage') / arch
+              archive_hash = digest(archive)
+              manifest['platforms']['linux/' + arch] = {
+                  'url': 'https://github.com/' + repo + '/releases/download/' + tag + '/' + archive.name,
+                  'sha256': archive_hash,
+                  'archive_bytes': archive.stat().st_size,
+                  'unpacked_bytes': sum(p.stat().st_size for p in stage.rglob('*') if p.is_file()),
+                  'binary_sha256': digest(stage/'ds2api'),
+              }
+              checksums.append(archive_hash + '  ' + archive.name)
+          Path('runtime-assets/release.json').write_text(json.dumps(manifest, indent=2) + '\n')
+          Path('runtime-assets/SHA256SUMS').write_text('\n'.join(checksums) + '\n')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write('tag=' + tag + '\n')
+          PY
+
+      - name: Publish versioned GitHub Release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.manifest.outputs.tag }}
+          IMAGE_REF: ${{ inputs.image_ref }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' \
+            'Precompiled DS2API runtime exports for Linux amd64 and arm64.' \
+            "Source image: $IMAGE_REF" \
+            'Source code and license: https://github.com/Tazimi1012/ds2api/tree/8316cf8a0352e900e03ce600b792083f590d80e2' \
+            'No runtime credentials are included. This export does not prove live account or Infrlo compatibility.' \
+            > runtime-assets/release-notes.txt
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "DS2API precompiled runtime $RELEASE_TAG" \
+            --notes-file runtime-assets/release-notes.txt \
+            runtime-assets/ds2api-linux-amd64.tar.gz \
+            runtime-assets/ds2api-linux-arm64.tar.gz \
+            runtime-assets/release.json \
+            runtime-assets/SHA256SUMS
+          {
+            echo '## Runtime export ready'
+            echo "Release: https://github.com/$GITHUB_REPOSITORY/releases/tag/$RELEASE_TAG"
+            echo ''
+            echo 'Download release.json and put it in the root of ds2api-infrlo-run alongside build.sh, start.sh, install.py and run.py.'
+            echo 'Delete the old single-line Dockerfile from the runtime repository when switching to the command-based deployment.'
+            echo ''
+            echo 'Infrlo Build Command: sh build.sh'
+            echo 'Infrlo Run Command: sh start.sh'
+            echo ''
+            echo 'Startup refuses to run unless the required runtime secrets exist.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the generated manifest for convenience
+        uses: actions/upload-artifact@v6
+        with:
+          name: infrlo-runtime-manifest
+          path: runtime-assets/release.json
+          retention-days: 14
